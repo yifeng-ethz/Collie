@@ -17,7 +17,13 @@ DEFINE_int32(port, 12000, "Tcp port");
 DEFINE_int32(min_rnr_timer, 14, "Minimal Receive Not Ready error");
 DEFINE_int32(hop_limit, 16, "Hop limit");
 DEFINE_int32(tos, 0, "Type of Service value");
-DEFINE_int32(qp_timeout, 0, "QP timeout value");
+// 0 means an INFINITE local ACK timeout per the IB spec, so an RC requester
+// that loses a packet waits forever instead of retransmitting. That is
+// invisible on a lossless (or same-host loopback) setup and a hard stall on a
+// lossy fabric. 14 is ~67 ms (4.096us * 2^14), the usual sane default.
+DEFINE_int32(qp_timeout, 14,
+             "RC local ACK timeout exponent: 4.096us * 2^timeout. \
+                                    0 means infinite (never retransmit).");
 DEFINE_int32(retry_cnt, 7, "QP retry count");
 DEFINE_int32(rnr_retry, 7, "Receive Not Ready retry count");
 DEFINE_int32(max_qp_rd_atom, 16, "max_qp_rd_atom");

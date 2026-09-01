@@ -25,12 +25,17 @@ class Engine(object):
     # @max_run_s: hard wall-clock bound for one engine process.  Every point is
     #             launched under `timeout -s KILL`, so a crashed or wedged
     #             search can never leave traffic running on the cluster.
-    def __init__(self, binary, ip_to_host={}, gid=3, tos=105, max_run_s=60):
+    # @qp_timeout: RC local ACK timeout exponent (4.096us * 2^n).  The engine's
+    #             own default used to be 0 = infinite, i.e. never retransmit,
+    #             which stalls the requester permanently on the first drop.
+    def __init__(self, binary, ip_to_host={}, gid=3, tos=105, max_run_s=60,
+                 qp_timeout=14):
         super(Engine).__init__()
         self._binary = binary
         self._gid = int(gid)
         self._tos = int(tos)
         self._max_run_s = int(max_run_s)
+        self._qp_timeout = int(qp_timeout)
         self._global_port = kPortBase
         self._base_port = kPortBase   # first port used by the current point
         self._commands = {}
@@ -108,18 +113,21 @@ class Engine(object):
                 # Set up server first
                 server_numa_node = server.get_numa()
                 server_cmd = (launch + " {} {} --server --port={} --gid={} --tos={}"
+                              " --qp_timeout={}"
                               " < /dev/null > {}server_{}.log 2>&1 &").format(
                     self._max_run_s, server_numa_node, server_numa_node,
                     self._binary, server.to_cmd(), traffic.to_cmd(),
-                    port, self._gid, self._tos, log, port)
+                    port, self._gid, self._tos, self._qp_timeout, log, port)
                 self._commands[server_ip]["server"].append(server_cmd)
                 # Then, the client.
                 client_numa_node = client.get_numa()
                 client_cmd = (launch + " {} {} --connect={} --port={} --gid={} --tos={}"
-                              " --run_infinitely < /dev/null > {}client_{}.log 2>&1 &").format(
+                              " --qp_timeout={} --run_infinitely"
+                              " < /dev/null > {}client_{}.log 2>&1 &").format(
                     self._max_run_s, client_numa_node, client_numa_node,
                     self._binary, client.to_cmd(), traffic.to_cmd(),
-                    server_ip, port, self._gid, self._tos, log, port)
+                    server_ip, port, self._gid, self._tos, self._qp_timeout,
+                    log, port)
                 self._commands[client_ip]["client"].append(client_cmd)
         return self._commands
 

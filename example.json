@@ -41,6 +41,8 @@
     "_margin": "bps AND pps must both be this far under their bar to count as reduced throughput",
     "max_run_s": 60,
     "_max_run_s": "hard `timeout -s KILL` bound on every engine process",
+    "qp_timeout": 14,
+    "_qp_timeout": "RC local ACK timeout exponent, 4.096us * 2^n (14 = ~67ms). MUST be nonzero on a lossy fabric: 0 means an INFINITE local ACK timeout, so the first dropped packet stalls the requester forever and the point silently measures 0 Gb/s.",
 
     "numa": [0, 0],
     "max_qps": 512,

@@ -119,7 +119,8 @@ class Director(object):
                               ip_to_host=self.get_ip_to_usr(),
                               gid=config.get("gid", 3),
                               tos=config.get("tos", 105),
-                              max_run_s=config.get("max_run_s", 60))
+                              max_run_s=config.get("max_run_s", 60),
+                              qp_timeout=config.get("qp_timeout", 14))
         numarange = tuple(config.get("numa", A_numarange))
         self._space = Space(usr_A=usr_A, usr_B=usr_B, ip_A=ip_A, ip_B=ip_B,
                             ibdev_A=ibdev_A, ibdev_B=ibdev_B, A_numarange=numarange, B_numarange=numarange,
