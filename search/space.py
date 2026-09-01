@@ -7,6 +7,7 @@
 
 
 
+import math
 import random
 import subprocess
 import logger
@@ -19,6 +20,24 @@ QP_TO_NAME = {0: "UD", 1: "UC", 2: "RC"}
 
 def shape_reqs_recv(req: int, align=32):
     return int((req + align - 1) / align) * align
+
+
+def log_randint(low: int, high: int):
+    '''
+        Draw a message size log-uniformly.
+
+        Upstream drew req_size/recv_size uniformly, which was fine over its
+        32B..128KiB range.  Over the 64B..4MiB range asked for here a uniform
+        draw is ~4MiB with overwhelming probability and small-message
+        behaviour -- exactly where RNIC performance anomalies live -- would
+        essentially never be sampled.  Log-uniform spreads the draws evenly
+        across the decades instead.
+    '''
+    if low >= high:
+        return low
+    lo = math.log(max(low, 1))
+    hi = math.log(high)
+    return int(min(high, max(low, round(math.exp(random.uniform(lo, hi))))))
 
 
 class Space:
@@ -39,7 +58,21 @@ class Space:
     '''
 
     def __init__(self, usr_A, usr_B, ip_A, ip_B, ibdev_A, ibdev_B, A_numarange=(0, 1), B_numarange=(0, 1),
-                 use_gpu=False, A_cudarange=(0, 0), B_cudarange=(0, 0), filename=None):
+                 use_gpu=False, A_cudarange=(0, 0), B_cudarange=(0, 0), filename=None,
+                 limits=None, max_qps=512, max_mrs=4096, mem_budget=8 << 30):
+        # @limits:      per-dimension {name: [lo, hi]} overrides from the JSON
+        #               config, applied after the defaults below.
+        # @max_qps:     hard cap on QPs a single point may create.
+        # @max_mrs:     hard cap on memory regions a single point may register.
+        # @mem_budget:  hard cap on host memory a single point may pin.  The
+        #               engine allocates mr_num * buf_num * buf_size per
+        #               process and a point can launch tens of processes, so
+        #               without this an unlucky draw (large buffers x many MRs
+        #               x many processes) OOMs the node rather than finding a
+        #               NIC anomaly.
+        self._max_qps = int(max_qps)
+        self._max_mrs = int(max_mrs)
+        self._mem_budget = int(mem_budget)
         if filename == None:
             # No configuration file is designated
             self._bounds = {}
@@ -48,25 +81,28 @@ class Space:
             self._bounds["numa_node"] = A_numarange
             self._bounds["{}_numa_node".format(ip_A)] = A_numarange
             self._bounds["{}_numa_node".format(ip_B)] = B_numarange
-            self._bounds["use_gpu"] = (0, 1)
+            # GDR is disabled: a degenerate (0, 0) bound keeps use_gpu out of
+            # the search without having to delete the dimension.
+            self._bounds["use_gpu"] = (0, 0)
             # Number of processes for each side traffic.
-            self._bounds["process_num"] = (4, 6)
-            # MTU
+            self._bounds["process_num"] = (1, 8)
+            # MTU -> {1024, 2048, 4096} path MTU (engine --mtu enum 3/4/5)
             self._bounds["mtu"] = (3, 5)
             # QP Type
             self._bounds["qp_type"] = (0, 2)
             # QP number that single CPU handles
-            self._bounds["qp_num"] = (1, 4)
+            self._bounds["qp_num"] = (1, 16)
             # MR number for each side, and for send/recv
-            self._bounds["mr_num"] = (1, 4)
+            self._bounds["mr_num"] = (1, 16)
             self._bounds["buf_num"] = (1, 4)
             # We don't take the buf_size as variable.
             # mr_size = buf_num * buf_size (where buf_size <- req_size & recv_size)
             # total memory used = mr_size * mr_num
             self._bounds["req_length"] = (1, 8)
             self._bounds["recv_length"] = (1, 4)
-            self._bounds["req_size"] = (32, 4096 * 32)
-            self._bounds["recv_size"] = (32, 4096 * 32)
+            # Message sizes: 64 B .. 4 MiB, drawn log-uniformly (see log_randint)
+            self._bounds["req_size"] = (64, 4 << 20)
+            self._bounds["recv_size"] = (64, 4 << 20)
             # WQE batching size and SG batching size
             self._bounds["send_batch"] = (1, 64)
             self._bounds["recv_batch"] = (1, 64)
@@ -75,6 +111,9 @@ class Space:
             # work queue depth
             self._bounds["send_wq_depth"] = (1, 1024)
             self._bounds["recv_wq_depth"] = (1, 1024)
+            if limits:
+                for key, bound in limits.items():
+                    self._bounds[key] = (int(bound[0]), int(bound[1]))
             self._best_numa_node = {ip_A: self.update_numa(
                 usr_A, ip_A, ibdev_A), ip_B: self.update_numa(usr_B, ip_B, ibdev_B)}
         else:
@@ -97,7 +136,13 @@ class Space:
     def randint(self, key):
         ret = -1
         try:
-            ret = random.randint(self._bounds[key][0], self._bounds[key][1])
+            lo, hi = self._bounds[key][0], self._bounds[key][1]
+            # Message sizes span six decades; draw them log-uniformly so the
+            # small-message regime is actually visited (see log_randint).
+            if key in ("req_size", "recv_size"):
+                ret = log_randint(lo, hi)
+            else:
+                ret = random.randint(lo, hi)
         except Exception as e:
             print(e)
         return ret
@@ -522,6 +567,7 @@ class Point(object):
         backward.random()
         self._traffics.append(forward)
         self._traffics.append(backward)
+        self.enforce_caps()
 
     def mutate(self, traffic_id: int, mutate_object: str, dim: str):
         traffic = self._traffics[traffic_id]
@@ -556,6 +602,7 @@ class Point(object):
                 endhost._send_wq_depth, endhost._send_batch)
             endhost._recv_wq_depth = max(
                 endhost._recv_wq_depth, endhost._recv_batch)
+        self.enforce_caps()
         return
 
     def get_dim_value(self, traffic_id: int, mutate_object: str, dim: str):
@@ -572,6 +619,66 @@ class Point(object):
         for traffic in self._traffics:
             ret += traffic.get_numqps()
         return ret
+
+    def get_total_mrs(self):
+        ret = 0
+        for traffic in self._traffics:
+            per_process = traffic._client._mr_num + traffic._server._mr_num
+            ret += traffic.get_process_num() * per_process
+        return ret
+
+    def get_total_mem(self):
+        # The engine registers mr_num * buf_num * buf_size per process
+        # (memory.cpp: rdma_region allocates num_ * size_ and share_mr makes
+        # every QP in the process share it), once for the client half and once
+        # for the server half of each traffic.
+        ret = 0
+        for traffic in self._traffics:
+            for end in (traffic._client, traffic._server):
+                ret += (traffic.get_process_num() * end._mr_num *
+                        end._buf_num * end._buf_size)
+        return ret
+
+    def enforce_caps(self):
+        '''
+            Clamp a freshly drawn or mutated point back inside the resource
+            caps configured on the Space.  Without this a single unlucky draw
+            (say 8 processes x 16 QPs x 16 MRs x 4 MiB buffers) either exhausts
+            the NIC's QP/MR tables or OOMs the host, and the point is scored as
+            a failed setup rather than telling us anything about the NIC.
+
+            Shrinks in order of least interest to the search: first the
+            replicated dimensions (qp_num, process_num), then the memory ones.
+        '''
+        space = self._space
+        for _ in range(64):
+            if self.get_total_qps() <= space._max_qps:
+                break
+            worst = max(self._traffics, key=lambda t: t.get_numqps())
+            if worst._qp_num > 1:
+                worst._qp_num -= 1
+            elif worst._process_num > 1:
+                worst._process_num -= 1
+            else:
+                break
+        for _ in range(256):
+            if (self.get_total_mrs() <= space._max_mrs and
+                    self.get_total_mem() <= space._mem_budget):
+                break
+            worst = max(self._traffics,
+                        key=lambda t: t.get_process_num() *
+                        (t._client._mr_num + t._server._mr_num))
+            ends = [worst._client, worst._server]
+            end = max(ends, key=lambda e: e._mr_num * e._buf_num)
+            if end._mr_num > 1:
+                end._mr_num -= 1
+            elif end._buf_num > 1:
+                end._buf_num -= 1
+            elif worst._process_num > 1:
+                worst._process_num -= 1
+            else:
+                break
+        return self
 
     def display(self):
         for traffic in self._traffics:
