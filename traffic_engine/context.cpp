@@ -930,6 +930,7 @@ int rdma_context::ServerDatapath() {
 }
 
 int rdma_context::ClientDatapath() {
+  if (FLAGS_burst_size > 0) return ClientBurstDatapath();
   auto req_vec = ParseReqFromStr();
   uint32_t batch_size = FLAGS_send_batch;
   size_t j = 0;
@@ -975,6 +976,152 @@ int rdma_context::ClientDatapath() {
       }
   }
   // Never reach here.
+  return 0;
+}
+
+uint64_t rdma_context::CountMsgsCompleted() {
+  uint64_t n = 0;
+  for (auto ep : endpoints_)
+    if (ep) n += ep->GetMsgsCompleted();
+  return n;
+}
+
+uint64_t rdma_context::CountBytesCompleted() {
+  uint64_t n = 0;
+  for (auto ep : endpoints_)
+    if (ep) n += ep->GetBytesCompleted();
+  return n;
+}
+
+static inline uint64_t MonoNs() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+// The inter-burst gap is spun on CLOCK_MONOTONIC rather than slept: usleep()
+// resolution on these kernels is ~50us, the same order as the gaps we replay.
+static inline void BurstGapWait(uint64_t gap_ns) {
+  if (!gap_ns) return;
+  const uint64_t deadline = MonoNs() + gap_ns;
+  while (MonoNs() < deadline) {
+  }
+}
+
+// Burst-paced client loop. One burst is exactly FLAGS_burst_size message
+// completions drawn from the repeating --request vector; posting inside a
+// burst still uses the existing send_batch/credit mechanics, so a burst can
+// span many post/poll rounds and many QPs.
+int rdma_context::ClientBurstDatapath() {
+  auto req_vec = ParseReqFromStr();
+  const uint64_t burst_size = (uint64_t)FLAGS_burst_size;
+  const uint64_t burst_count = (uint64_t)FLAGS_burst_count;  // 0 = infinite
+  const uint64_t gap_ns = (uint64_t)FLAGS_burst_gap_us * 1000ull;
+  const uint32_t batch_size = (uint32_t)FLAGS_send_batch;
+  size_t j = 0;  // request-vector cursor, shared across QPs as in ClientDatapath
+
+  std::vector<uint64_t> burst_ns;
+  if (burst_count) burst_ns.reserve(burst_count);
+  uint64_t bursts_done = 0, msgs_done = 0, bytes_done = 0, sum_burst_ns = 0;
+  uint64_t wall_start_ns = 0, wall_end_ns = 0;
+
+  while (burst_count == 0 || bursts_done < burst_count) {
+    const uint64_t base_msgs = CountMsgsCompleted();
+    const uint64_t base_bytes = CountBytesCompleted();
+    uint64_t posted = 0, t_first_post = 0, t_last_comp = 0;
+    while (true) {
+      for (auto ep : endpoints_) {
+        if (posted >= burst_size) break;
+        if (!ep) continue;                  // Ignore those dead ones
+        if (!ep->GetActivated()) continue;  // YOU ARE NOT PREPARED!
+        // Never overshoot the burst: the tail post may be a short batch.
+        uint32_t to_post = (uint32_t)std::min<uint64_t>(batch_size,
+                                                        burst_size - posted);
+        if (to_post > (uint32_t)ep->GetSendCredits()) continue;
+        // Shuffle the buffer that is used.
+        for (auto &req : req_vec) {
+          for (int i = 0; i < req.sge_num; i++) {
+            auto buf = PickNextBuffer(0);
+            req.sglist[i].addr = buf->addr_;
+            req.sglist[i].lkey = buf->local_K_;
+          }
+        }
+        if (!t_first_post) {
+          t_first_post = MonoNs();
+          if (!wall_start_ns) wall_start_ns = t_first_post;
+        }
+        if (ep->PostSend(req_vec, j, to_post,
+                         remote_mempools_[ep->GetMemId()])) {
+          LOG(ERROR) << "PostSend() failed";
+          exit(1);
+        }
+        posted += to_post;
+      }
+      for (auto cq : send_cqs_) {
+        if (FLAGS_hw_ts) {
+          if (PollEachEx(cq.cq_ex) != 0) {
+            LOG(ERROR) << "PollEachEx() failed";
+            exit(1);
+          }
+        } else {
+          if (PollEach(cq.cq) < 0) {
+            LOG(ERROR) << "PollEach() failed";
+            exit(1);
+          }
+        }
+        if (CountMsgsCompleted() - base_msgs >= burst_size) {
+          t_last_comp = MonoNs();
+          break;
+        }
+      }
+      if (t_last_comp) break;
+    }
+    const uint64_t dur = t_last_comp - t_first_post;
+    burst_ns.push_back(dur);
+    sum_burst_ns += dur;
+    msgs_done += CountMsgsCompleted() - base_msgs;
+    bytes_done += CountBytesCompleted() - base_bytes;
+    wall_end_ns = t_last_comp;
+    bursts_done++;
+    if (_print_thp) {
+      auto ts = Now64();
+      for (auto ep : endpoints_) {
+        if (!ep || !ep->GetActivated()) continue;
+        ep->PrintThroughput(ts);
+      }
+    }
+    // No gap after the final burst: wall == sum(burst) + (K-1) * gap.
+    if (burst_count == 0 || bursts_done < burst_count) BurstGapWait(gap_ns);
+  }
+
+  std::sort(burst_ns.begin(), burst_ns.end());
+  const size_t n = burst_ns.size();
+  if (n == 0) return 0;  // unreachable: burst_count == 0 loops forever
+  const double wall_us = (wall_end_ns - wall_start_ns) / 1000.0;
+  const double sum_us = sum_burst_ns / 1000.0;
+  auto pct = [&](double p) {
+    size_t k = (size_t)(n * p);
+    if (k >= n) k = n - 1;
+    return burst_ns[k] / 1000.0;
+  };
+  printf(
+      "BURSTSTATS bursts=%lu msgs=%lu bytes=%lu burst_size=%d gap_us=%d "
+      "batch=%d qps=%d min_us=%.3f p50_us=%.3f mean_us=%.3f p99_us=%.3f "
+      "max_us=%.3f sum_burst_us=%.3f wall_us=%.3f burst_goodput_gbps=%.4f "
+      "wall_goodput_gbps=%.4f\n",
+      (unsigned long)bursts_done, (unsigned long)msgs_done,
+      (unsigned long)bytes_done, FLAGS_burst_size, FLAGS_burst_gap_us,
+      FLAGS_send_batch, FLAGS_qp_num, burst_ns[0] / 1000.0, pct(0.50),
+      sum_us / n, pct(0.99), burst_ns[n - 1] / 1000.0, sum_us, wall_us,
+      sum_us > 0 ? bytes_done * 8.0 / (sum_us * 1000.0) : 0.0,
+      wall_us > 0 ? bytes_done * 8.0 / (wall_us * 1000.0) : 0.0);
+  fflush(stdout);
+
+  // All completions are reaped by construction, so the QPs can be torn down.
+  for (auto &ep : endpoints_) {
+    delete ep;
+    ep = nullptr;
+  }
   return 0;
 }
 

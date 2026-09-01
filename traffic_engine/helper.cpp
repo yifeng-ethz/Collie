@@ -17,7 +17,13 @@ DEFINE_int32(port, 12000, "Tcp port");
 DEFINE_int32(min_rnr_timer, 14, "Minimal Receive Not Ready error");
 DEFINE_int32(hop_limit, 16, "Hop limit");
 DEFINE_int32(tos, 0, "Type of Service value");
-DEFINE_int32(qp_timeout, 0, "QP timeout value");
+// 0 means an INFINITE local ACK timeout per the IB spec, so an RC requester
+// that loses a packet waits forever instead of retransmitting. That is
+// invisible on a lossless (or same-host loopback) setup and a hard stall on a
+// lossy fabric. 14 is ~67 ms (4.096us * 2^14), the usual sane default.
+DEFINE_int32(qp_timeout, 14,
+             "RC local ACK timeout exponent: 4.096us * 2^timeout. \
+                                    0 means infinite (never retransmit).");
 DEFINE_int32(retry_cnt, 7, "QP retry count");
 DEFINE_int32(rnr_retry, 7, "Receive Not Ready retry count");
 DEFINE_int32(max_qp_rd_atom, 16, "max_qp_rd_atom");
@@ -50,7 +56,22 @@ DEFINE_int32(gpu_id, 0, "Cuda device id");
 DEFINE_bool(hw_ts, false, "Hardware timestamp enable?");
 
 DEFINE_bool(run_infinitely, false, "Will run infinitely");
-DEFINE_int32(iters, 200000, "Iterations one QP will send");
+// NOTE: this counts passes of the outer client loop, NOT messages per QP.
+// Each pass posts --send_batch WRs of every element of --request to every
+// activated QP, so messages ~= iters * activated_qps * send_batch * |request|.
+// A pass in which a QP has no send credits still counts.
+DEFINE_int32(iters, 200000,
+             "Client datapath loop iterations (NOT messages per QP): each \
+                                    iteration posts send_batch WRs of every \
+                                    --request element to every activated QP");
+
+DEFINE_int32(burst_size, 0,
+             "Client burst mode: message completions per burst. \
+                                    0 (default) disables burst mode entirely.");
+DEFINE_int32(burst_gap_us, 0,
+             "Idle gap after a burst's last completion is reaped, in us");
+DEFINE_int32(burst_count, 0,
+             "Bursts to run before the client exits. 0 means infinite");
 
 DEFINE_int32(send_sge_batch_size, 1, "The sge_num for client");
 DEFINE_int32(recv_sge_batch_size, 1,

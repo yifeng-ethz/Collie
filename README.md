@@ -1,3 +1,22 @@
+# About this fork
+
+Upstream `bytedance/Collie` was archived (read-only) on 2025-07-21, so these fixes cannot be filed as issues or PRs. They come from running Collie on a **lossy, PFC-off** 100 GbE RoCEv2 fabric with two real endpoints; upstream is validated on a same-host, lossless, PFC-enabled setup, and outside that envelope several failures are *silent* — the search keeps running and scores affected points as clean. Item-by-item changelog, with upstream `f16217c` file:line citations: [`CHANGES-hacc-fork.md`](CHANGES-hacc-fork.md).
+
+Running on a lossy / PFC-off fabric, four things matter:
+
+1. **`qp_timeout`** — upstream defaults it to 0 = *infinite* local ACK timeout, so the first dropped packet stalls an RC requester forever and the point measures 0 Gb/s with no error. Now 14 (~67 ms) by default and passed by the search; override with `"qp_timeout"` in the config.
+2. **`"monitor": "sysfs"`** (the new default) reads `ethtool -S` plus InfiniBand sysfs — no `mlnx_perf`, no root — and makes the `-1` verdict a real backpressure/loss test. With PFC off, upstream's pause-duration signal is identically zero.
+3. **Monitor both endpoints.** This fork still samples only endpoint A, so receiver-side and in-switch loss remain invisible to it (see *Known limitations* in the changelog).
+4. **Define a "find" by throughput.** At 100 G saturation nearly every clean point moves some loss counter, so "any movement is an anomaly" is unusable; treat loss signals as advisory against a measured clean-ceiling baseline.
+
+A third-host-driven runner that does 2–4 properly — dual-endpoint monitoring, management-alias SSH, rate-vs-baseline scoring — lives in the **`hacc-fpga-llm`** repo under `tools/collie-soak/`, and imports `search/space.py` from this tree unmodified.
+
+New engine flags `--burst_size` / `--burst_gap_us` / `--burst_count` replay a collective's burst-then-idle pattern and print a `BURSTSTATS` line; off by default, see `traffic_engine/README.md`.
+
+Fork changes are MIT, same as upstream.
+
+---
+
 # Collie
 Collie is for uncovering RDMA NIC performance anomalies. 
 

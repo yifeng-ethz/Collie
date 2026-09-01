@@ -50,6 +50,36 @@ class MlnxHwMon(BaseHwMon):
         return {}
 
 
+class SysfsHwMon(BaseHwMon):
+    '''
+        Unprivileged stand-in for MlnxHwMon.
+
+        The NDA diagnostic counters NeoHost exposes are not available here, but
+        a few genuinely diagnostic ones are readable without root -- notably
+        outbound_pci_stalled_rd/wr(+_events), which report the NIC stalling on
+        the PCIe host interface and are the closest public analogue to the
+        counters Collie's paper drives its search with.
+
+        This monitor does not sample the hardware itself: it re-uses the
+        snapshot SysfsBoneMon already took for this point, so a point still
+        costs exactly one measurement window instead of two, and the bone and
+        diagnostic views are guaranteed to describe the same window.
+
+        @bonemon:  the bone.SysfsBoneMon instance measuring this run.
+        @counters: optional whitelist; empty means "all diagnostic counters".
+    '''
+
+    def __init__(self, bonemon, counters=None):
+        super(SysfsHwMon, self).__init__("", counters or [])
+        self._bonemon = bonemon
+
+    def monitor(self, identity):
+        result = self._bonemon.diag_counters(getattr(self._bonemon, "_last", {}))
+        if self._counters:
+            result = {k: v for k, v in result.items() if k in self._counters}
+        return result
+
+
 '''
     BrcmHwMon Implementation
 '''

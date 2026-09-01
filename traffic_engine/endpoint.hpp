@@ -40,6 +40,10 @@ class rdma_endpoint {
 
   std::queue<int> send_batch_size_;
   std::queue<int> recv_batch_size_;
+  // Only the last WR of a posted batch is signaled, so a single send CQE
+  // retires a whole batch. This keeps the byte weight of each in-flight batch
+  // so burst mode can account retired messages/bytes instead of CQEs.
+  std::queue<uint64_t> send_batch_bytes_;
 
   bool activated_ = false;
   void *master_ = nullptr;
@@ -51,6 +55,16 @@ class rdma_endpoint {
   uint64_t msgs_sent_last_ = 0;
   uint64_t msgs_sent_now_ = 0;
   uint64_t timestamp_ = 0;
+  uint64_t msgs_completed_ = 0;
+  uint64_t bytes_completed_ = 0;
+  // Receiver-side counterparts. bytes_sent_* is bumped only in PostSend, so
+  // without these a process that only receives reports nothing at all -- and
+  // UD has no sender-side delivery signal, which makes per-sender delivery
+  // attribution in an N->1 UD test impossible.
+  uint64_t bytes_recv_last_ = 0;
+  uint64_t bytes_recv_now_ = 0;
+  uint64_t msgs_recv_last_ = 0;
+  uint64_t msgs_recv_now_ = 0;
 
  public:
   rdma_endpoint(uint32_t id, ibv_qp *qp)
@@ -78,6 +92,8 @@ class rdma_endpoint {
   enum ibv_qp_type GetType() { return qp_type_; }
   int GetQpn() { return qp_->qp_num; }
   int GetSendCredits() { return send_credits_; }
+  uint64_t GetMsgsCompleted() { return msgs_completed_; }
+  uint64_t GetBytesCompleted() { return bytes_completed_; }
   int GetRecvCredits() { return recv_credits_; }
   int GetMemId() { return rmem_id_; }
   bool GetActivated() { return activated_; }

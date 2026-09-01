@@ -59,6 +59,42 @@
     ```
 
 
+- **`--send_batch` is not queue depth.** `--send_batch` is the number of WRs
+  handed to a single `post_send` call; pipeline depth is `--send_wq_depth`,
+  which defaults to **1024**. Reading `--send_batch=1` as "depth 1" is an easy
+  mistake and an expensive one: an arm built that way is still pipelined
+  1024-deep, and in our measurements it missed a depth-1 model by 5x, while
+  `--send_wq_depth=1` reproduced the intended behaviour to within 1.3%.
+
+- **Burst mode (fork addition, off by default).** The default client datapath
+  keeps the send queue as full as credits allow, which measures a saturating
+  stream. Collective phases of a distributed job instead alternate a fixed
+  amount of data with an idle gap, and the interesting number is the *time to
+  complete one burst*, not the average rate. Setting **--burst_size** to a
+  nonzero value switches the client to a burst-paced loop: it posts and reaps
+  exactly `burst_size` message completions, waits **--burst_gap_us** on
+  CLOCK_MONOTONIC (spun, not slept -- usleep resolution here is ~50 us, the
+  same order as the gaps being replayed), and repeats **--burst_count** times
+  (0 = forever). Posting inside a burst still uses the existing
+  `--send_batch` / credit mechanics, so one burst may span many post/poll
+  rounds and many QPs.
+
+  On exit the client prints one `BURSTSTATS` line with the per-burst duration
+  distribution (min/p50/mean/p99/max, microseconds), the summed burst time,
+  the wall time, and goodput computed both ways -- `burst_goodput_gbps`
+  excludes the gaps, `wall_goodput_gbps` includes them. Accounting is by
+  retired completion, not by posted WR, which is why the endpoint now carries
+  the byte weight of each in-flight batch: only the last WR of a batch is
+  signalled, so a single CQE retires the whole batch.
+
+  ```
+  ./collie_engine --connect=192.168.0.1 --dev=mlx5_0 --gid=3 --qp_type=2 \
+      --qp_num=1 --request=w_1_65536 --burst_size=256 --burst_gap_us=200 --burst_count=1000
+  ```
+
+  With `--burst_size` unset (the default 0) the client takes the original
+  code path and behaviour is unchanged.
+
 - Collie mainly tests between two endhosts while traffic engine support incast (many to one or one to many) communications. Here are important parameters for this use.
     - **--host_num**: the number of clients that a server need to serve. (Total number of QPs = host_num * qp_per_host)
     - **--connect**: multiple IPs or hostnames, split by ',' (e.g., --connect=host-01,host-02)

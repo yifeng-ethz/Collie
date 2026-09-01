@@ -13,7 +13,9 @@ import json
 import copy
 import subprocess
 
-from numpy.core.arrayprint import format_float_scientific
+# NOTE: upstream imported numpy.core.arrayprint.format_float_scientific here.
+# It was unused, and numpy 2.x renamed numpy.core to numpy._core, so the import
+# aborts the whole search on any current numpy.
 import hardware
 import bone
 from space import MTU_TO_REQ, QP_TO_NAME, Endhost, Point, Space, Traffic
@@ -91,18 +93,57 @@ class Director(object):
         self._bonedev_B = bonedev_B
         # Class below
         self._config = config
-        self._hwmon = hardware.MlnxHwMon(
-            self._hwmon_binary, config["counters"])
-        self._bonemon = bone.MlnxBoneMon(**config["bars"])
+        # "sysfs" (default) is the unprivileged ethtool + infiniband-sysfs
+        # monitor; "mlnx" keeps the upstream mlnx_perf path for sites that have
+        # the vendor tooling and PFC enabled.
+        if config.get("monitor", "sysfs") == "mlnx":
+            self._bonemon = bone.MlnxBoneMon(**config["bars"])
+            self._hwmon = hardware.MlnxHwMon(
+                self._hwmon_binary, config["counters"])
+        else:
+            self._bonemon = bone.SysfsBoneMon(
+                ibdev=config.get("ibdev", ibdev_A),
+                ib_port=config.get("ib_port", 1),
+                margin=config.get("margin", 0.20),
+                window=config.get("window", 10.0),
+                settle=config.get("settle", 2.0),
+                # Per-QP-type ceilings; when present, the reduced-throughput
+                # (-2) test compares each point against the bar for the
+                # transport(s) it contains instead of one RC-WRITE bar.
+                type_bars=config.get("type_bars"),
+                **config["bars"])
+            # Re-uses the bone monitor's snapshot, so a point still costs one
+            # measurement window rather than two.
+            self._hwmon = hardware.SysfsHwMon(self._bonemon, config["counters"])
         self._engine = Engine(self._traffic_binary,
-                              ip_to_host=self.get_ip_to_usr())
+                              ip_to_host=self.get_ip_to_usr(),
+                              gid=config.get("gid", 3),
+                              tos=config.get("tos", 105),
+                              max_run_s=config.get("max_run_s", 60),
+                              qp_timeout=config.get("qp_timeout", 14))
+        numarange = tuple(config.get("numa", A_numarange))
         self._space = Space(usr_A=usr_A, usr_B=usr_B, ip_A=ip_A, ip_B=ip_B,
-                            ibdev_A=ibdev_A, ibdev_B=ibdev_B, A_numarange=A_numarange, B_numarange=B_numarange,
-                            use_gpu=use_gpu, A_cudarange=A_cudarange, B_cudarange=B_cudarange)
+                            ibdev_A=ibdev_A, ibdev_B=ibdev_B, A_numarange=numarange, B_numarange=numarange,
+                            use_gpu=use_gpu, A_cudarange=A_cudarange, B_cudarange=B_cudarange,
+                            limits=config.get("limits"),
+                            max_qps=config.get("max_qps", 512),
+                            max_mrs=config.get("max_mrs", 4096),
+                            mem_budget=config.get("mem_budget", 8 << 30))
+        # Objective: "perf" maximises the shortfall below perf_ceiling (the
+        # upstream behaviour, but with the ceiling measured rather than the
+        # hardcoded 128); "counter:<name>" maximises a diagnostic counter.
+        self._objective = config.get("objective", "perf")
+        self._perf_ceiling = float(config.get(
+            "perf_ceiling", 2.0 * config["bars"]["bps_bar"]))
+        # Wall-clock bound for the whole search; whichever of this and iters
+        # comes first ends the run.
+        self._time_budget = float(config.get("time_budget_s", 0)) or None
+        self._run_mfs = bool(config.get("mfs", False))
         if logpath[-1] != '/':
             logpath += '/'
         self._log_path = logpath
         self._global_log_idx = 1
+        self._summary = []
         logger.Init(logpath)
 
     def get_ip_to_usr(self):
@@ -149,30 +190,33 @@ class Director(object):
         return float(hw_results[self._target_counter])
 
     def get_perf_bps(self, point: Point, bone_results):
-        forward = 0
-        backward = 0
-        for req in point._traffics[0]._reqs:
-            if 'r' in req:
-                backward = 1
-            else:
-                forward = 1
-        if point._traffics[1]._server._ip == point._traffics[1]._client._ip:
-            backward = forward = 1
-        else:
-            for req in point._traffics[1]._reqs:
-                if 'r' in req:
-                    forward = 1
-                else:
-                    backward = 1
-        # PCIe bandwidth is the real upper bound
-        return float((forward + backward) * 128.0 - bone_results["tx_vport_rdma_unicast_bytes"] - bone_results["rx_vport_rdma_unicast_bytes"])
+        # Energy = how far this point falls short of the achievable ceiling, so
+        # that "maximise energy" means "find the configuration that makes the
+        # NIC slowest".  Upstream hardcoded a 128 Gb/s PCIe ceiling scaled by
+        # the number of active directions; here the ceiling is measured on the
+        # actual link (perf_ceiling in the config) because on internal-HCA
+        # loopback the achievable rate is neither the wire rate nor the PCIe
+        # rate.  SysfsBoneMon already reports bps as tx+rx in Gbit/s.
+        achieved = float(bone_results.get("bps", 0.0))
+        return max(self._perf_ceiling - achieved, 0.0)
 
     # This is less useful in reality since ML cares bandwidth
     def get_perf_pps(self, point: Point, bone_results):
-        cnt = 1
-        if point._traffics[1]._client._ip != point._traffics[1]._server._ip:
-            cnt += 1  # Not loopback
-        return float(2 * self._config["bars"]["pps_bar"] - bone_results["tx_vport_rdma_unicast_packets"] - bone_results["rx_vport_rdma_unicast_packets"])
+        ceiling = 2.0 * float(self._config["bars"]["pps_bar"])
+        return max(ceiling - float(bone_results.get("pps", 0.0)), 0.0)
+
+    def get_energy(self, point: Point, bone_results, hw_results):
+        '''
+            The SA energy for one point, selected by config["objective"]:
+              "perf"             -> throughput shortfall below perf_ceiling
+              "counter:<name>"   -> a diagnostic counter delta to maximise,
+                                    e.g. "counter:outbound_pci_stalled_wr"
+            Both are maximised, so the annealing schedule below is unchanged.
+        '''
+        if self._objective.startswith("counter:"):
+            name = self._objective.split(":", 1)[1]
+            return float(hw_results.get(name, 0.0))
+        return self.get_perf_bps(point, bone_results)
 
     def init_mutate_space(self):
         # Modify here
@@ -181,9 +225,20 @@ class Director(object):
         # endhost_list.append("use_gpu")
         traffic_list = ["process_num", "qp_num",
                         "mtu", "qp_type", "reqs", "recvs"]
-        self._mutate_space = {"traffic": traffic_list.copy(),
-                              "client": endhost_list.copy() + ["send_wq_depth", "send_batch"],
-                              "server": endhost_list.copy() + ["recv_wq_depth", "recv_batch"]}
+        space = {"traffic": traffic_list.copy(),
+                 "client": endhost_list.copy() + ["send_wq_depth", "send_batch"],
+                 "server": endhost_list.copy() + ["recv_wq_depth", "recv_batch"]}
+        # Drop dimensions whose bound is a single value (numa_node on a
+        # single-socket node, use_gpu with GDR off).  Mutating them can never
+        # change anything, so keeping them just wastes points.
+        def live(dim):
+            b = self._space._bounds.get(dim)
+            return b is None or b[0] != b[1]
+        self._mutate_space = {k: [d for d in v if live(d)]
+                              for k, v in space.items()}
+        for k in list(self._mutate_space):
+            if not self._mutate_space[k]:
+                del self._mutate_space[k]
 
     def mutate_point(self, prev_point):
         point = copy.deepcopy(prev_point)
@@ -227,7 +282,7 @@ class Director(object):
             log_reproduce(
                 self._log_path + "reproduce/{}".format(self._global_log_idx), point, self._engine)
             self._global_log_idx += 1
-            if self._bonemon.check_bone(bone_results):
+            if self._bonemon.check_bone(bone_results, point):
                 self.error_point(point, bone_results, hw_results)
             if record:
                 ret.append(
@@ -258,7 +313,7 @@ class Director(object):
             log_reproduce(
                 self._log_path + "reproduce/{}".format(self._global_log_idx), point, self._engine)
             self._global_log_idx += 1
-            if self._bonemon.check_bone(bone_results):
+            if self._bonemon.check_bone(bone_results, point):
                 self.error_point(point, bone_results, hw_results)
         return
 
@@ -273,44 +328,79 @@ class Director(object):
         prev_target_value = kPerfInitValue
         self.init_mutate_space()
         logger.LOG("Simulated Annealing Started", "BLOCK")
-        anomaly_flag = kStageIterations
+        # How many points one annealing chain runs before restarting from a
+        # fresh random point.  Configurable because the useful value depends on
+        # the point budget: short runs want more restarts (coverage), long runs
+        # want longer chains (actual annealing).
+        stage_iterations = int(
+            self._config.get("stage_iterations", 0)) or kStageIterations
+        anomaly_flag = stage_iterations
         temp = kStartTemp
+        # Alpha is scaled to the point budget so that a short validation run
+        # still traverses the whole hot->cold schedule instead of staying hot.
+        alpha = float(self._config.get("alpha", 0)) or kAlpha
+        started = time.time()
         # Alpha and T decides the iterations. We can also set the "fixed" value
         for i in range(iters):
+            if self._time_budget and (time.time() - started) > self._time_budget:
+                logger.LOG("Time budget of {}s reached after {} points".format(
+                    self._time_budget, i), "BLOCK")
+                break
             if self._engine.clean_process():
+                self.write_summary()
                 return -1
             if anomaly_flag <= 0:
                 prev_point.random()
                 point = copy.deepcopy(prev_point)
                 prev_target_value = kPerfInitValue
-                anomaly_flag = kStageIterations
+                anomaly_flag = stage_iterations
             else:
                 point = self.mutate_point(prev_point)
                 # Attention: mutate_point does not modify prev_point
             # If the point matches found MFS, we jump out.
+            # NOTE: upstream also did `prev_point = copy.deepcopy(point)` here,
+            # i.e. it moved the chain anchor to the new candidate BEFORE the
+            # acceptance test below had run.  That made both acceptance
+            # branches no-ops and the reject path unable to restore the
+            # previous state.  Only the acceptance test moves the anchor now.
             while True:
                 if self._mfs_engine.match_mfs(point):
                     point.random()  # TODO: shrink the search space to avoid redundant loop random iterations
                 else:
-                    prev_point = copy.deepcopy(point)
                     break
             if (self._engine.set_up_traffic(point)):
+                # No result file is written for a failed setup, so tag the row
+                # with the index it would have taken.
+                self.record_point(point, {}, {}, -4, idx=self._global_log_idx)
+                # A discarded point still costs the chain one step.  Upstream
+                # jumped straight to the next iteration without touching
+                # anomaly_flag, so a structurally invalid point could be
+                # mutated indefinitely and the chain never reached
+                # anomaly_flag <= 0 to restart from a fresh random point.
+                anomaly_flag -= 1
                 continue
             bone_results = self._bonemon.monitor(self._bonedev_A)
-            hw_results = {}
-            # Diagnostic counters are now publicly available
-            #hw_results = self._hwmon.monitor(self._identity_A)
+            # Diagnostic counters now come from the same window the bone
+            # monitor just measured (hardware.SysfsHwMon), so this costs
+            # nothing extra and the two views always agree.
+            hw_results = self._hwmon.monitor(self._identity_A)
             log_result(self._log_path + "result/{}".format(self._global_log_idx),
                        point, bone_results, hw_results)
             log_reproduce(
                 self._log_path + "reproduce/{}".format(self._global_log_idx), point, self._engine)
             self._global_log_idx += 1
             anomaly_flag -= 1
-            ret = self._bonemon.check_bone(bone_results)
+            ret = self._bonemon.check_bone(bone_results, point)
+            # Stop this point's traffic as soon as it has been measured, so a
+            # point never overlaps the next one's measurement window.
+            self._engine.clean_process()
+            self.record_point(point, bone_results, hw_results, ret)
             if ret != 0:
                 self.error_point(point, bone_results, hw_results)
                 # Because we add one before
-                if ret == -1:
+                if ret == -1 and self._run_mfs:
+                    # MFS costs dozens of extra traffic runs per anomaly, which
+                    # blows any short wall-clock budget; gated on config["mfs"].
                     logger.LOG("An anomaly found. Starts to compute MFS...", "BLOCK")
                     self._mfs_engine.set_mfs_id(self._global_log_idx - 1)
                     mfs = self._mfs_engine.generate_mfs_from_point(
@@ -321,7 +411,7 @@ class Director(object):
                 anomaly_flag = -1
             # generate_mfs_from_point will clean processes before execute.
             # However, it may leave some processes. So we should clean right here.
-            target_value = self.get_perf_bps(point, bone_results)
+            target_value = self.get_energy(point, bone_results, hw_results)
             if target_value >= prev_target_value:
                 # We find a better or equal one
                 prev_target_value = target_value
@@ -333,12 +423,49 @@ class Director(object):
                 if (random.random() > probability):
                     prev_point = copy.deepcopy(point)
             # Temperature decreases. Maybe should be eliminated since we have multiple solutions.
-            temp = temp * kAlpha
+            temp = temp * alpha
             logger.LOG(point.log_to_dict(), "INFO")
             print("")
             print("")
         self._engine.clean_process()
+        self.write_summary()
         return 0
+
+    kRetToErr = {0: "clean",
+                 -1: "backpressure/loss",
+                 -2: "reduced throughput",
+                 -3: "no traffic observed",
+                 -4: "setup failed"}
+
+    def record_point(self, point, bone_results, hw_results, ret, idx=None):
+        '''
+            One machine-readable row per tested point.  Upstream only wrote a
+            per-point file plus console output, which makes a run hard to
+            summarise afterwards; this keeps the whole run in one JSON file.
+        '''
+        row = {"idx": self._global_log_idx - 1 if idx is None else idx,
+               "verdict": self.kRetToErr.get(ret, str(ret)),
+               "ret": ret,
+               "bps_gbps": round(bone_results.get("bps", 0.0), 3),
+               "pps": round(bone_results.get("pps", 0.0), 1),
+               "total_qps": point.get_total_qps(),
+               "total_mrs": point.get_total_mrs(),
+               "mem_bytes": point.get_total_mem(),
+               "point": point.log_to_dict()}
+        if isinstance(self._bonemon, bone.SysfsBoneMon) and bone_results:
+            row["anomaly_counters"] = self._bonemon.anomaly_counters(
+                bone_results)
+            row["diag_counters"] = {k: v for k, v in hw_results.items() if v}
+        self._summary.append(row)
+        logger.LOG("[point {}] {}  {:.2f} Gb/s  {:.0f} pps  qps={} mrs={}".format(
+            row["idx"], row["verdict"], row["bps_gbps"], row["pps"],
+            row["total_qps"], row["total_mrs"]),
+            "INFO" if ret == 0 else "WARNING")
+        self.write_summary()
+
+    def write_summary(self):
+        with open(self._log_path + "summary.json", "w") as f:
+            json.dump(self._summary, f, indent=1)
 
     def diag_simulated_annealing(self, iters=1000):
         # Old version using diagnostic counters
@@ -396,7 +523,7 @@ class Director(object):
                     self._log_path + "reproduce/{}".format(self._global_log_idx), point, self._engine)
                 self._global_log_idx += 1
                 anomaly_flag -= 1
-                ret = self._bonemon.check_bone(bone_results)
+                ret = self._bonemon.check_bone(bone_results, point)
                 if ret != 0:
                     self.error_point(point, bone_results, hw_results)
                     # Because we add one before
@@ -465,7 +592,7 @@ class MinimalFeatureSet(object):
         if self._engine.set_up_traffic(point):
             return -1
         result = self._bonemon.monitor(self._bonedev)
-        ret = self._bonemon.check_bone(result)
+        ret = self._bonemon.check_bone(result, point)
         log_result(
             self._log_path + "result/mfs_help/{}/{}".format(self._id, name), point, result, {})
         log_reproduce(
@@ -792,16 +919,23 @@ class MinimalFeatureSet(object):
             # Receive pattern test
             tmp_result = self.test_recvs_size(test_point, i)
             mfs = {**mfs, **tmp_result}
-            # MTU
-            mtu_set = [3, 4, 5]
-            ori_mtu = test_traffic._mtu
-            mtu_set.remove(test_traffic._mtu)
-            for mtu in mtu_set:
-                test_traffic._mtu = mtu
-                if not self.is_anomalous(test_point, "{}_mtu_{}".format(i, mtu)):
-                    test_traffic._mtu = ori_mtu
-                    mfs["mtu"] = (ori_mtu, ori_mtu)
-                    break
+            # MTU.  --mtu is inert for UD: the RTR transition sets
+            # attr.path_mtu and adds IBV_QP_PATH_MTU only for RC/UC
+            # (helper.cpp:172, :186), while UD falls through
+            # `case IBV_QPT_UD: break;` (helper.cpp:188-189) and always runs at
+            # the port MTU.  That is correct per the spec, but sweeping the
+            # dimension anyway spends three traffic runs per UD anomaly on a
+            # parameter that cannot change anything.
+            if QP_TO_NAME[test_traffic._qp_type] != "UD":
+                mtu_set = [3, 4, 5]
+                ori_mtu = test_traffic._mtu
+                mtu_set.remove(test_traffic._mtu)
+                for mtu in mtu_set:
+                    test_traffic._mtu = mtu
+                    if not self.is_anomalous(test_point, "{}_mtu_{}".format(i, mtu)):
+                        test_traffic._mtu = ori_mtu
+                        mfs["mtu"] = (ori_mtu, ori_mtu)
+                        break
             endhost = self.generate_mfs_from_endhost(test_point, i)
             ret_mfs[i] = {**mfs, **endhost}
         # The simplified test_point is right here.
@@ -817,7 +951,7 @@ class MinimalFeatureSet(object):
             self._engine.clean_process()
             return {}
         result = self._bonemon.monitor(self._bonedev)
-        if not self._bonemon.check_bone(result):
+        if not self._bonemon.check_bone(result, test_point):
             # No anomaly. This can be sometimes due to false positive(setup/kill) err
             return {}
         log_result(

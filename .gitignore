@@ -1,0 +1,3 @@
+# Python bytecode caches (search/ is imported as a package by external drivers)
+__pycache__/
+*.py[cod]

@@ -98,6 +98,11 @@ class rdma_context {
   std::vector<rdma_request> ParseReqFromStr();
   std::vector<rdma_request> ParseRecvFromStr();
 
+  // Burst-paced client loop, used only when --burst_size > 0.
+  int ClientBurstDatapath();
+  uint64_t CountMsgsCompleted();
+  uint64_t CountBytesCompleted();
+
  public:
   rdma_context(const char *dev_name, int gid_idx, int num_of_hosts,
                int num_per_host, bool print_thp)
