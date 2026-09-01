@@ -20,18 +20,27 @@ kPortTop = 60000
 
 class Engine(object):
     # @binary: the absolute path of the traffic_engine
-    def __init__(self, binary, ip_to_host={}):
+    # @gid: RoCE GID index to bind (index of the RoCEv2/IPv4 entry)
+    # @tos: IP ToS for the data path
+    # @max_run_s: hard wall-clock bound for one engine process.  Every point is
+    #             launched under `timeout -s KILL`, so a crashed or wedged
+    #             search can never leave traffic running on the cluster.
+    def __init__(self, binary, ip_to_host={}, gid=3, tos=105, max_run_s=60):
         super(Engine).__init__()
         self._binary = binary
+        self._gid = int(gid)
+        self._tos = int(tos)
+        self._max_run_s = int(max_run_s)
         self._global_port = kPortBase
         self._base_port = kPortBase   # first port used by the current point
         self._commands = {}
         self._ip_to_host = ip_to_host
         self._scripts_path = "/tmp/collie-scripts/"
+        self._engine_log_path = self._scripts_path + "engine-logs/"
         cmd = "rm -rf {}".format(self._scripts_path)
         print (cmd)
         subprocess.check_output(cmd, shell=True)
-        cmd = "mkdir -p {}".format(self._scripts_path)
+        cmd = "mkdir -p {}".format(self._engine_log_path)
         print (cmd)
         subprocess.check_output(cmd, shell=True)
 
@@ -85,19 +94,29 @@ class Engine(object):
                 self._commands[client_ip] = {"server": [], "client": []}
             for i in range(traffic.get_process_num()):
                 port = self._next_port()
+                # `nohup ... < /dev/null &` so the processes survive the ssh
+                # session that launched them, and `timeout -s KILL` so they can
+                # never outlive the point they belong to.  --use_cuda/--gpu_id
+                # are dropped entirely: GDR is disabled here and the engine
+                # defaults to use_cuda=false, so passing them only risks gflags
+                # rejecting Python's "True"/"False" capitalisation.
+                launch = "nohup timeout -s KILL {} numactl -N {} -m {} {}"
+                log = self._engine_log_path
                 # Set up server first
                 server_numa_node = server.get_numa()
-                server_cmd = "numactl -N {} -m {} {} {} {} --server --port={} --use_cuda={} --tos=105 --share_mr --gpu_id=0 2>/dev/null &".format(
-                    server_numa_node, server_numa_node,
+                server_cmd = (launch + " {} {} --server --port={} --gid={} --tos={} --share_mr"
+                              " < /dev/null > {}server_{}.log 2>&1 &").format(
+                    self._max_run_s, server_numa_node, server_numa_node,
                     self._binary, server.to_cmd(), traffic.to_cmd(),
-                    port, bool(server._use_gpu))
+                    port, self._gid, self._tos, log, port)
                 self._commands[server_ip]["server"].append(server_cmd)
                 # Then, the client.
                 client_numa_node = client.get_numa()
-                client_cmd = "numactl -N {} -m {} {} {} {} --connect={} --port={} --use_cuda={} --tos=105  --share_mr --gpu_id=0 --run_infinitely 2>/dev/null &".format(
-                    client_numa_node, client_numa_node,
+                client_cmd = (launch + " {} {} --connect={} --port={} --gid={} --tos={} --share_mr"
+                              " --run_infinitely < /dev/null > {}client_{}.log 2>&1 &").format(
+                    self._max_run_s, client_numa_node, client_numa_node,
                     self._binary, client.to_cmd(), traffic.to_cmd(),
-                    server_ip, port, bool(client._use_gpu))
+                    server_ip, port, self._gid, self._tos, log, port)
                 self._commands[client_ip]["client"].append(client_cmd)
         return self._commands
 
@@ -153,24 +172,34 @@ class Engine(object):
             cmd = ["scp", "{}{}_server.sh".format(self._scripts_path, ip), "{}{}_client.sh".format(self._scripts_path, ip),
                    "{}@{}:/tmp/".format(self._ip_to_host[ip], ip)]
             try:
-                subprocess.check_output(cmd)
+                subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
             except Exception as e:
                 print(e)
                 return -1
             setup_cmd = ["ssh", "-n", "-f", "{}@{}".format(self._ip_to_host[ip], ip),
                          "bash /tmp/{}_server.sh".format(ip)]
             try:
-                subprocess.run(setup_cmd, stdout=subprocess.DEVNULL)
+                # stderr too: sites with an ssh login banner otherwise reprint
+                # it for every process launched, drowning the search log.
+                subprocess.run(setup_cmd, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
             except Exception as e:
                 print(e)
                 return -1
         # We have copied the scripts to all hosts and have set up servers.
         # Now we only need to set up clients
+        # The engine's client does not retry its out-of-band connect: if it
+        # runs before the server is listening the point produces no traffic at
+        # all.  Upstream got its grace period for free from the per-host ssh
+        # round trip, which is ~0 when every endpoint is the same host (as in
+        # loopback), so make the gap explicit.
+        time.sleep(2)
         for ip in ips:
             cmd = ["ssh", "-n", "-f", "{}@{}".format(self._ip_to_host[ip], ip),
                    "bash /tmp/{}_client.sh".format(ip)]
             try:
-                subprocess.run(cmd, stdout=subprocess.DEVNULL)
+                subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
             except Exception as e:
                 print(e)
                 return -1
