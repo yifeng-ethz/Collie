@@ -56,7 +56,14 @@ DEFINE_int32(gpu_id, 0, "Cuda device id");
 DEFINE_bool(hw_ts, false, "Hardware timestamp enable?");
 
 DEFINE_bool(run_infinitely, false, "Will run infinitely");
-DEFINE_int32(iters, 200000, "Iterations one QP will send");
+// NOTE: this counts passes of the outer client loop, NOT messages per QP.
+// Each pass posts --send_batch WRs of every element of --request to every
+// activated QP, so messages ~= iters * activated_qps * send_batch * |request|.
+// A pass in which a QP has no send credits still counts.
+DEFINE_int32(iters, 200000,
+             "Client datapath loop iterations (NOT messages per QP): each \
+                                    iteration posts send_batch WRs of every \
+                                    --request element to every activated QP");
 
 DEFINE_int32(burst_size, 0,
              "Client burst mode: message completions per burst. \
