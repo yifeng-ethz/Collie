@@ -437,8 +437,11 @@ class Traffic(object):
         req_str = ""
         for req in reqs:
             req_str += req + ","
-        req_str.rstrip(',')
-        return req_str
+        # rstrip() returns a new string; upstream dropped the result and
+        # returned the unstripped one, so every --request= / --receive=
+        # carried a trailing comma.  The engine's splitter tolerates it, so
+        # this was cosmetic, but it is one character from being a real bug.
+        return req_str.rstrip(',')
 
     def to_cmd(self):
         req_str = self.req_to_str(self._reqs)
