@@ -357,11 +357,15 @@ class Director(object):
                 point = self.mutate_point(prev_point)
                 # Attention: mutate_point does not modify prev_point
             # If the point matches found MFS, we jump out.
+            # NOTE: upstream also did `prev_point = copy.deepcopy(point)` here,
+            # i.e. it moved the chain anchor to the new candidate BEFORE the
+            # acceptance test below had run.  That made both acceptance
+            # branches no-ops and the reject path unable to restore the
+            # previous state.  Only the acceptance test moves the anchor now.
             while True:
                 if self._mfs_engine.match_mfs(point):
                     point.random()  # TODO: shrink the search space to avoid redundant loop random iterations
                 else:
-                    prev_point = copy.deepcopy(point)
                     break
             if (self._engine.set_up_traffic(point)):
                 # No result file is written for a failed setup, so tag the row
