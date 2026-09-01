@@ -5,10 +5,59 @@
     "engine": "/tmp/collie/traffic_engine/collie_engine",
     "iters": 1000,
     "bars": {
-        "tx_pfc_bar": 1000.0, 
+        "tx_pfc_bar": 1000.0,
         "rx_pfc_bar": 0,
         "bps_bar": 90.0,
         "pps_bar": 4000000.0
     },
-    "diag_counters": []
+    "_bars": "bps_bar/pps_bar are the FALLBACK reduced-throughput bars used only when type_bars is absent or a point exposes no recognised transport; PFC bars are inert while PFC is off.",
+
+    "type_bars": {
+        "RC_WRITE": {"bps": 165.9, "pps": 5365711},
+        "RC_SEND":  {"bps": 164.0, "pps": 5054017},
+        "RC_READ":  {"bps": 166.4, "pps": 5290560},
+        "UD_SEND":  {"bps": 109.8, "pps": 3296917}
+    },
+    "_type_bars": "Per-transport loopback throughput ceilings (bps in Gbit/s tx+rx, pps in pkt/s tx+rx), each 0.85 x the measured max for that transport. The sysfs monitor compares every point against the MIN bar over the transports it contains (bar_key: UD->UD_SEND; RC/UC write->RC_WRITE, read->RC_READ, send->RC_SEND). A UD point is thus judged against the UD ceiling (MTU-capped, ~129 Gb/s) instead of the RC-WRITE ceiling it cannot physically reach, which removes the UD false positives. The -1 backpressure/loss signal is unaffected.",
+
+    "diag_counters": [],
+
+    "_comment": "Everything below is optional; defaults in parentheses.",
+
+    "monitor": "sysfs",
+    "_monitor": "sysfs (default) = unprivileged ethtool -S + infiniband sysfs, anomaly = backpressure/loss counters. mlnx = upstream mlnx_perf + PFC pause duration.",
+    "netdev": "rdma0",
+    "ibdev": "mlx5_0",
+    "ib_port": 1,
+    "gid": 3,
+    "_gid": "GID index of the RoCEv2/IPv4 entry (see /sys/class/infiniband/<dev>/ports/<n>/gid_attrs/types/)",
+    "tos": 105,
+
+    "window": 10.0,
+    "_window": "seconds of steady-state traffic measured per point",
+    "settle": 2.0,
+    "_settle": "seconds after QPs reach RTS before the first counter snapshot",
+    "margin": 0.20,
+    "_margin": "bps AND pps must both be this far under their bar to count as reduced throughput",
+    "max_run_s": 60,
+    "_max_run_s": "hard `timeout -s KILL` bound on every engine process",
+
+    "numa": [0, 0],
+    "max_qps": 512,
+    "max_mrs": 4096,
+    "mem_budget": 8589934592,
+    "limits": {},
+    "_limits": "per-dimension overrides, e.g. {\"qp_num\": [1, 8], \"req_size\": [64, 1048576]}",
+
+    "objective": "perf",
+    "_objective": "perf = maximise throughput shortfall below perf_ceiling; counter:<name> = maximise a diagnostic counter, e.g. counter:outbound_pci_stalled_wr",
+    "perf_ceiling": 180.0,
+    "_perf_ceiling": "measured achievable Gb/s; defaults to 2 * bps_bar",
+
+    "mfs": false,
+    "_mfs": "compute the Minimal Feature Set for each anomaly. Costs dozens of extra traffic runs per anomaly.",
+    "time_budget_s": 0,
+    "_time_budget_s": "wall-clock bound for the whole search; 0 = unbounded, iters alone decides",
+    "alpha": 0.99,
+    "_alpha": "SA cooling rate; scale down for short runs so the schedule still completes"
 }
