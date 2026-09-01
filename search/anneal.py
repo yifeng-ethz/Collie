@@ -13,7 +13,9 @@ import json
 import copy
 import subprocess
 
-from numpy.core.arrayprint import format_float_scientific
+# NOTE: upstream imported numpy.core.arrayprint.format_float_scientific here.
+# It was unused, and numpy 2.x renamed numpy.core to numpy._core, so the import
+# aborts the whole search on any current numpy.
 import hardware
 import bone
 from space import MTU_TO_REQ, QP_TO_NAME, Endhost, Point, Space, Traffic

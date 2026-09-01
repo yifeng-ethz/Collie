@@ -86,7 +86,10 @@ class Space:
         try:
             best_numa_node = int(
                 subprocess.check_output(cmd).decode().rstrip('\n'))
-            return best_numa_node
+            # Single-socket machines report numa_node = -1 for the device.
+            # Passing that straight to `numactl -N -1` makes every engine
+            # launch fail, so fall back to node 0.
+            return max(best_numa_node, 0)
         except Exception as e:
             print(e)
             return 0
@@ -134,6 +137,12 @@ class Endhost(object):
         self._recv_wq_depth = self._space.randint("recv_wq_depth")
         self._send_batch = self._space.randint("send_batch")
         self._recv_batch = self._space.randint("recv_batch")
+        # A work queue shallower than one batch cannot hold the batch the
+        # engine is about to post, and the run dies at setup.  Point.mutate()
+        # already enforced this invariant; random() did not, which silently
+        # threw away a large share of randomly drawn points.
+        self._send_wq_depth = max(self._send_wq_depth, self._send_batch)
+        self._recv_wq_depth = max(self._recv_wq_depth, self._recv_batch)
 
     def to_cmd(self):
         cmd = "--dev={} --mr_num={} --buf_num={} --buf_size={} --send_batch={} --recv_batch={} --send_wq_depth={} --recv_wq_depth={} ".format(
@@ -521,6 +530,11 @@ class Point(object):
             return
         bound = self._space._bounds[dim[1:]]
         cur_val = self.get_dim_value(traffic_id, mutate_object, dim)
+        # A degenerate bound (e.g. numa_node on a single-socket node, or the
+        # disabled use_gpu dimension) admits no nonzero delta, and upstream's
+        # `while delta_value == 0` would spin forever.  Nothing to mutate.
+        if bound[0] == bound[1]:
+            return
         delta_value = 0
         while delta_value == 0:
             delta_value = random.randint(
@@ -528,7 +542,10 @@ class Point(object):
         if mutate_object == "_traffic":
             # MTU, reqs, recvs will affect
             traffic.__setattr__(dim, cur_val + delta_value)
-            if "MTU" in dim and delta_value < 0:  # The MTU gets smaller
+            # dim is "_mtu", so upstream's `"MTU" in dim` was never true and a
+            # shrinking MTU never regenerated the request vector -- leaving UD
+            # requests larger than the new path MTU, which the engine rejects.
+            if "mtu" in dim and delta_value < 0:  # The MTU gets smaller
                 traffic.mutate_req_recv()
             if "qp_type" in dim and traffic._qp_type != 2:  # opcode and size should be modified
                 traffic.mutate_req_recv()

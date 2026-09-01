@@ -7,7 +7,9 @@
 
 
 import subprocess
-from numpy.lib.stride_tricks import _maybe_view_as_subclass
+# NOTE: upstream also imported numpy.lib.stride_tricks._maybe_view_as_subclass
+# here.  It was unused and the private symbol no longer exists in numpy >= 1.25,
+# so importing it aborts the whole search on any current numpy.
 
 
 def Init(path=None):
