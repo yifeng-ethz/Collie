@@ -26,7 +26,7 @@ Credit where it is due: the tool did find a real anomaly for us (SGE-gather-indu
 | NIC | ConnectX-5 Ex, 100 GbE, `mlx5_0` |
 | Firmware | 16.32.2004 (two nodes), 16.31.2006 (one node) |
 | Transport | RoCEv2, GID index 3, port MTU 4096, ToS 105 |
-| Fabric | 2-tier leaf-spine Clos with VXLAN overlay, **PFC off** (hardware PFCC register), lossy; global pause emitted by receivers is absorbed at the first hop; DCQCN active at firmware default (CNP loop works, traffic sent with ToS 105 = ECT(1)) |
+| Fabric | 2-tier leaf-spine Clos with VXLAN overlay, **PFC off** (hardware PFCC register), lossy; global pause emitted by receivers is absorbed at the first hop; DCQCN active at firmware default (CNP loop works; the NIC stamps ECT(0) on every RoCEv2 packet regardless of the requested ToS, so Not-ECT RoCE cannot be produced from verbs) |
 | OS | Ubuntu 22.04, kernel 6.8; in-box `mlx5_core` + rdma-core (no MLNX_OFED, no `mlnx_perf`) |
 | Collie | upstream `f16217c`, engine built `make -j8` (no GDR) |
 | Topology | search driven from a third host over SSH; endpoints are two cluster nodes |
