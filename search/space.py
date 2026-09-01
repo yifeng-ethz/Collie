@@ -106,6 +106,13 @@ class Space:
             # WQE batching size and SG batching size
             self._bounds["send_batch"] = (1, 64)
             self._bounds["recv_batch"] = (1, 64)
+            # NOTE: these two bounds are live, but NOT because the engine
+            # flags of the same name do anything -- the engine defines
+            # --send_sge_batch_size / --recv_sge_batch_size and never reads
+            # them.  They are live only because they shape the number of SGEs
+            # in each `w_<nsge>_<size>...` element of the request string, which
+            # is what the engine actually acts on.  Do not "fix" this by
+            # passing the flags on the command line.
             self._bounds["send_sge_batch_size"] = (1, 4)
             self._bounds["recv_sge_batch_size"] = (1, 4)
             # work queue depth

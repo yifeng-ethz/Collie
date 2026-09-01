@@ -100,11 +100,14 @@ class Engine(object):
                 # are dropped entirely: GDR is disabled here and the engine
                 # defaults to use_cuda=false, so passing them only risks gflags
                 # rejecting Python's "True"/"False" capitalisation.
+                # --share_mr is also gone: the engine defines the flag but
+                # never reads it, so passing it only made the command line read
+                # as if MR sharing were being exercised.
                 launch = "nohup timeout -s KILL {} numactl -N {} -m {} {}"
                 log = self._engine_log_path
                 # Set up server first
                 server_numa_node = server.get_numa()
-                server_cmd = (launch + " {} {} --server --port={} --gid={} --tos={} --share_mr"
+                server_cmd = (launch + " {} {} --server --port={} --gid={} --tos={}"
                               " < /dev/null > {}server_{}.log 2>&1 &").format(
                     self._max_run_s, server_numa_node, server_numa_node,
                     self._binary, server.to_cmd(), traffic.to_cmd(),
@@ -112,7 +115,7 @@ class Engine(object):
                 self._commands[server_ip]["server"].append(server_cmd)
                 # Then, the client.
                 client_numa_node = client.get_numa()
-                client_cmd = (launch + " {} {} --connect={} --port={} --gid={} --tos={} --share_mr"
+                client_cmd = (launch + " {} {} --connect={} --port={} --gid={} --tos={}"
                               " --run_infinitely < /dev/null > {}client_{}.log 2>&1 &").format(
                     self._max_run_s, client_numa_node, client_numa_node,
                     self._binary, client.to_cmd(), traffic.to_cmd(),
