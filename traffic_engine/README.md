@@ -59,6 +59,13 @@
     ```
 
 
+- **`--send_batch` is not queue depth.** `--send_batch` is the number of WRs
+  handed to a single `post_send` call; pipeline depth is `--send_wq_depth`,
+  which defaults to **1024**. Reading `--send_batch=1` as "depth 1" is an easy
+  mistake and an expensive one: an arm built that way is still pipelined
+  1024-deep, and in our measurements it missed a depth-1 model by 5x, while
+  `--send_wq_depth=1` reproduced the intended behaviour to within 1.3%.
+
 - **Burst mode (fork addition, off by default).** The default client datapath
   keeps the send queue as full as credits allow, which measures a saturating
   stream. Collective phases of a distributed job instead alternate a fixed
