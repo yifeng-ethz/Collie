@@ -30,15 +30,17 @@ if __name__ == "__main__":
     # Users should set their expectation/anomaly threshold here.
     bars = config["bars"]
     # end of user parameters input
-    config = {}
-    config["bars"] = bars
-    diag_counters = [
-        # Diagnostic counters are not publicly available.
-        # If vendor provides, should add here and modify hardware/monitor.py
-    ]
-    config["counters"] = diag_counters
+    # The whole config is handed to the Director rather than being rebuilt from
+    # three keys, so device/objective/budget settings can live in the JSON.
+    # config["counters"] optionally restricts which diagnostic counters are
+    # collected; empty means "all that hardware.py can read".
+    config.setdefault("counters", config.get("diag_counters", []))
     director = Director(traffic_binary=collie_engine,
                         hwmon_binary="",
                         config=config, ip_A=iplist[0], ip_B=iplist[-1],
-                        usr_A=username, usr_B=username, logpath=logpath)
+                        usr_A=username, usr_B=username, logpath=logpath,
+                        ibdev_A=config.get("ibdev", "mlx5_0"),
+                        ibdev_B=config.get("ibdev", "mlx5_0"),
+                        bonedev_A=config.get("netdev", "rdma0"),
+                        bonedev_B=config.get("netdev", "rdma0"))
     ret = director.simulated_annealing(iters=iters)

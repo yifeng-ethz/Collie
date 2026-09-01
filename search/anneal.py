@@ -93,18 +93,56 @@ class Director(object):
         self._bonedev_B = bonedev_B
         # Class below
         self._config = config
-        self._hwmon = hardware.MlnxHwMon(
-            self._hwmon_binary, config["counters"])
-        self._bonemon = bone.MlnxBoneMon(**config["bars"])
+        # "sysfs" (default) is the unprivileged ethtool + infiniband-sysfs
+        # monitor; "mlnx" keeps the upstream mlnx_perf path for sites that have
+        # the vendor tooling and PFC enabled.
+        if config.get("monitor", "sysfs") == "mlnx":
+            self._bonemon = bone.MlnxBoneMon(**config["bars"])
+            self._hwmon = hardware.MlnxHwMon(
+                self._hwmon_binary, config["counters"])
+        else:
+            self._bonemon = bone.SysfsBoneMon(
+                ibdev=config.get("ibdev", ibdev_A),
+                ib_port=config.get("ib_port", 1),
+                margin=config.get("margin", 0.20),
+                window=config.get("window", 10.0),
+                settle=config.get("settle", 2.0),
+                # Per-QP-type ceilings; when present, the reduced-throughput
+                # (-2) test compares each point against the bar for the
+                # transport(s) it contains instead of one RC-WRITE bar.
+                type_bars=config.get("type_bars"),
+                **config["bars"])
+            # Re-uses the bone monitor's snapshot, so a point still costs one
+            # measurement window rather than two.
+            self._hwmon = hardware.SysfsHwMon(self._bonemon, config["counters"])
         self._engine = Engine(self._traffic_binary,
-                              ip_to_host=self.get_ip_to_usr())
+                              ip_to_host=self.get_ip_to_usr(),
+                              gid=config.get("gid", 3),
+                              tos=config.get("tos", 105),
+                              max_run_s=config.get("max_run_s", 60))
+        numarange = tuple(config.get("numa", A_numarange))
         self._space = Space(usr_A=usr_A, usr_B=usr_B, ip_A=ip_A, ip_B=ip_B,
-                            ibdev_A=ibdev_A, ibdev_B=ibdev_B, A_numarange=A_numarange, B_numarange=B_numarange,
-                            use_gpu=use_gpu, A_cudarange=A_cudarange, B_cudarange=B_cudarange)
+                            ibdev_A=ibdev_A, ibdev_B=ibdev_B, A_numarange=numarange, B_numarange=numarange,
+                            use_gpu=use_gpu, A_cudarange=A_cudarange, B_cudarange=B_cudarange,
+                            limits=config.get("limits"),
+                            max_qps=config.get("max_qps", 512),
+                            max_mrs=config.get("max_mrs", 4096),
+                            mem_budget=config.get("mem_budget", 8 << 30))
+        # Objective: "perf" maximises the shortfall below perf_ceiling (the
+        # upstream behaviour, but with the ceiling measured rather than the
+        # hardcoded 128); "counter:<name>" maximises a diagnostic counter.
+        self._objective = config.get("objective", "perf")
+        self._perf_ceiling = float(config.get(
+            "perf_ceiling", 2.0 * config["bars"]["bps_bar"]))
+        # Wall-clock bound for the whole search; whichever of this and iters
+        # comes first ends the run.
+        self._time_budget = float(config.get("time_budget_s", 0)) or None
+        self._run_mfs = bool(config.get("mfs", False))
         if logpath[-1] != '/':
             logpath += '/'
         self._log_path = logpath
         self._global_log_idx = 1
+        self._summary = []
         logger.Init(logpath)
 
     def get_ip_to_usr(self):
