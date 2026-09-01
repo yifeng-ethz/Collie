@@ -914,16 +914,23 @@ class MinimalFeatureSet(object):
             # Receive pattern test
             tmp_result = self.test_recvs_size(test_point, i)
             mfs = {**mfs, **tmp_result}
-            # MTU
-            mtu_set = [3, 4, 5]
-            ori_mtu = test_traffic._mtu
-            mtu_set.remove(test_traffic._mtu)
-            for mtu in mtu_set:
-                test_traffic._mtu = mtu
-                if not self.is_anomalous(test_point, "{}_mtu_{}".format(i, mtu)):
-                    test_traffic._mtu = ori_mtu
-                    mfs["mtu"] = (ori_mtu, ori_mtu)
-                    break
+            # MTU.  --mtu is inert for UD: the RTR transition sets
+            # attr.path_mtu and adds IBV_QP_PATH_MTU only for RC/UC
+            # (helper.cpp:172, :186), while UD falls through
+            # `case IBV_QPT_UD: break;` (helper.cpp:188-189) and always runs at
+            # the port MTU.  That is correct per the spec, but sweeping the
+            # dimension anyway spends three traffic runs per UD anomaly on a
+            # parameter that cannot change anything.
+            if QP_TO_NAME[test_traffic._qp_type] != "UD":
+                mtu_set = [3, 4, 5]
+                ori_mtu = test_traffic._mtu
+                mtu_set.remove(test_traffic._mtu)
+                for mtu in mtu_set:
+                    test_traffic._mtu = mtu
+                    if not self.is_anomalous(test_point, "{}_mtu_{}".format(i, mtu)):
+                        test_traffic._mtu = ori_mtu
+                        mfs["mtu"] = (ori_mtu, ori_mtu)
+                        break
             endhost = self.generate_mfs_from_endhost(test_point, i)
             ret_mfs[i] = {**mfs, **endhost}
         # The simplified test_point is right here.
