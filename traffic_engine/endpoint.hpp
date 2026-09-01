@@ -57,6 +57,14 @@ class rdma_endpoint {
   uint64_t timestamp_ = 0;
   uint64_t msgs_completed_ = 0;
   uint64_t bytes_completed_ = 0;
+  // Receiver-side counterparts. bytes_sent_* is bumped only in PostSend, so
+  // without these a process that only receives reports nothing at all -- and
+  // UD has no sender-side delivery signal, which makes per-sender delivery
+  // attribution in an N->1 UD test impossible.
+  uint64_t bytes_recv_last_ = 0;
+  uint64_t bytes_recv_now_ = 0;
+  uint64_t msgs_recv_last_ = 0;
+  uint64_t msgs_recv_now_ = 0;
 
  public:
   rdma_endpoint(uint32_t id, ibv_qp *qp)

@@ -227,14 +227,27 @@ int rdma_endpoint::RecvHandler(struct ibv_wc *wc) {
   // recv_batch_size_.pop();
   // recv_credits_ += update_credits;
   recv_credits_++;
+  // Account what actually arrived. ParseEachEx() (the --hw_ts extended-CQ
+  // path) calls this with wc == nullptr, so the byte count is only available
+  // on the ordinary PollEach() path. For UD, byte_len includes the 40-byte
+  // GRH that the HCA scatters ahead of the payload.
+  if (wc) {
+    bytes_recv_now_ += wc->byte_len;
+    msgs_recv_now_++;
+  }
   return 0;
 }
 
 void rdma_endpoint::PrintThroughput(uint64_t timestamp) {
-  if (bytes_sent_last_ == 0) {
+  // A receiver never bumps bytes_sent_*, so gating the start of the interval
+  // on the send counters alone left PrintThroughput returning here forever on
+  // a receive-only process.
+  if (bytes_sent_last_ == 0 && bytes_recv_last_ == 0) {
     timestamp_ = timestamp;
     bytes_sent_last_ = bytes_sent_now_;
     msgs_sent_last_ = msgs_sent_now_;
+    bytes_recv_last_ = bytes_recv_now_;
+    msgs_recv_last_ = msgs_recv_now_;
     return;
   }
   auto t = timestamp - timestamp_;
@@ -251,8 +264,23 @@ void rdma_endpoint::PrintThroughput(uint64_t timestamp) {
     LOG(INFO) << "\t\t\t\t"
               << " Message rate is " << qps << " Krps (" << qps / 1000.0
               << " Mrps)";
+    // Only emitted when this endpoint has actually received something, so a
+    // sender's output is unchanged.
+    if (bytes_recv_now_) {
+      auto rx_throughput =
+          (bytes_recv_now_ - bytes_recv_last_) * 8.0 * 1.0 / t;  // mbps
+      auto rx_qps =
+          (msgs_recv_now_ - msgs_recv_last_) * 1.0 * 1000.0 / t;  // krps
+      LOG(INFO) << "\t\t\t\t"
+                << " RecvBytes=" << bytes_recv_now_
+                << " RecvRate=" << (int)rx_throughput << " Mbps ("
+                << rx_throughput / 1000.0 << " Gbps)  recv message rate "
+                << rx_qps << " Krps (" << rx_qps / 1000.0 << " Mrps)";
+    }
     bytes_sent_last_ = bytes_sent_now_;
     msgs_sent_last_ = msgs_sent_now_;
+    bytes_recv_last_ = bytes_recv_now_;
+    msgs_recv_last_ = msgs_recv_now_;
   }
   return;
 }
