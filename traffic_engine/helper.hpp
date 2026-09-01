@@ -74,6 +74,11 @@ DECLARE_bool(hw_ts);
 DECLARE_bool(run_infinitely);
 DECLARE_int32(iters);
 
+// Client-side burst pacing (LLM kernel replay).
+DECLARE_int32(burst_size);
+DECLARE_int32(burst_gap_us);
+DECLARE_int32(burst_count);
+
 DECLARE_int32(recv_batch);
 DECLARE_int32(send_batch);
 DECLARE_int32(sge_num);

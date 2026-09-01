@@ -16,6 +16,7 @@ int rdma_endpoint::PostSend(const std::vector<rdma_request> &requests,
   struct ibv_send_wr wr_list[kMaxBatch];
   struct ibv_sge sgs[kMaxBatch][kMaxSge];
   size_t rbuf_idx = 0;
+  uint64_t batch_bytes = 0;
   for (uint32_t i = 0; i < batch_size; i++) {
     int wr_size = 0;
     auto &req = requests[req_idx];
@@ -24,6 +25,7 @@ int rdma_endpoint::PostSend(const std::vector<rdma_request> &requests,
       sgs[i][j].lkey = req.sglist[j].lkey;
       sgs[i][j].length = req.sglist[j].length;
       bytes_sent_now_ += sgs[i][j].length;
+      batch_bytes += sgs[i][j].length;
       wr_size += sgs[i][j].length;
     }
     memset(&wr_list[i], 0, sizeof(struct ibv_send_wr));
@@ -90,6 +92,7 @@ int rdma_endpoint::PostSend(const std::vector<rdma_request> &requests,
   }
   send_credits_ -= batch_size;
   send_batch_size_.push(batch_size);
+  send_batch_bytes_.push(batch_bytes);
   return 0;
 }
 
@@ -212,6 +215,9 @@ int rdma_endpoint::SendHandler(struct ibv_wc *wc) {
   auto update_credits = send_batch_size_.front();
   send_batch_size_.pop();
   send_credits_ += update_credits;
+  msgs_completed_ += update_credits;
+  bytes_completed_ += send_batch_bytes_.front();
+  send_batch_bytes_.pop();
   return 0;
 }
 

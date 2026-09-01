@@ -52,6 +52,14 @@ DEFINE_bool(hw_ts, false, "Hardware timestamp enable?");
 DEFINE_bool(run_infinitely, false, "Will run infinitely");
 DEFINE_int32(iters, 200000, "Iterations one QP will send");
 
+DEFINE_int32(burst_size, 0,
+             "Client burst mode: message completions per burst. \
+                                    0 (default) disables burst mode entirely.");
+DEFINE_int32(burst_gap_us, 0,
+             "Idle gap after a burst's last completion is reaped, in us");
+DEFINE_int32(burst_count, 0,
+             "Bursts to run before the client exits. 0 means infinite");
+
 DEFINE_int32(send_sge_batch_size, 1, "The sge_num for client");
 DEFINE_int32(recv_sge_batch_size, 1,
              "The sge_num for server to post recv requests");
