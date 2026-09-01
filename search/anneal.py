@@ -367,6 +367,12 @@ class Director(object):
                 # No result file is written for a failed setup, so tag the row
                 # with the index it would have taken.
                 self.record_point(point, {}, {}, -4, idx=self._global_log_idx)
+                # A discarded point still costs the chain one step.  Upstream
+                # jumped straight to the next iteration without touching
+                # anomaly_flag, so a structurally invalid point could be
+                # mutated indefinitely and the chain never reached
+                # anomaly_flag <= 0 to restart from a fresh random point.
+                anomaly_flag -= 1
                 continue
             bone_results = self._bonemon.monitor(self._bonedev_A)
             # Diagnostic counters now come from the same window the bone
