@@ -229,7 +229,7 @@ class Director(object):
             log_reproduce(
                 self._log_path + "reproduce/{}".format(self._global_log_idx), point, self._engine)
             self._global_log_idx += 1
-            if self._bonemon.check_bone(bone_results):
+            if self._bonemon.check_bone(bone_results, point):
                 self.error_point(point, bone_results, hw_results)
             if record:
                 ret.append(
@@ -260,7 +260,7 @@ class Director(object):
             log_reproduce(
                 self._log_path + "reproduce/{}".format(self._global_log_idx), point, self._engine)
             self._global_log_idx += 1
-            if self._bonemon.check_bone(bone_results):
+            if self._bonemon.check_bone(bone_results, point):
                 self.error_point(point, bone_results, hw_results)
         return
 
@@ -308,7 +308,7 @@ class Director(object):
                 self._log_path + "reproduce/{}".format(self._global_log_idx), point, self._engine)
             self._global_log_idx += 1
             anomaly_flag -= 1
-            ret = self._bonemon.check_bone(bone_results)
+            ret = self._bonemon.check_bone(bone_results, point)
             if ret != 0:
                 self.error_point(point, bone_results, hw_results)
                 # Because we add one before
@@ -398,7 +398,7 @@ class Director(object):
                     self._log_path + "reproduce/{}".format(self._global_log_idx), point, self._engine)
                 self._global_log_idx += 1
                 anomaly_flag -= 1
-                ret = self._bonemon.check_bone(bone_results)
+                ret = self._bonemon.check_bone(bone_results, point)
                 if ret != 0:
                     self.error_point(point, bone_results, hw_results)
                     # Because we add one before
@@ -467,7 +467,7 @@ class MinimalFeatureSet(object):
         if self._engine.set_up_traffic(point):
             return -1
         result = self._bonemon.monitor(self._bonedev)
-        ret = self._bonemon.check_bone(result)
+        ret = self._bonemon.check_bone(result, point)
         log_result(
             self._log_path + "result/mfs_help/{}/{}".format(self._id, name), point, result, {})
         log_reproduce(
@@ -819,7 +819,7 @@ class MinimalFeatureSet(object):
             self._engine.clean_process()
             return {}
         result = self._bonemon.monitor(self._bonedev)
-        if not self._bonemon.check_bone(result):
+        if not self._bonemon.check_bone(result, test_point):
             # No anomaly. This can be sometimes due to false positive(setup/kill) err
             return {}
         log_result(
