@@ -46,7 +46,9 @@ int main(int argc, char **argv) {
     }
     pici_client->ClientDatapath();
   }
-  listen_thread.join();
-  server_thread.join();
+  // In client-only mode these threads were never started, and joining a
+  // default-constructed std::thread throws std::system_error(EINVAL).
+  if (listen_thread.joinable()) listen_thread.join();
+  if (server_thread.joinable()) server_thread.join();
   return 0;
 }
